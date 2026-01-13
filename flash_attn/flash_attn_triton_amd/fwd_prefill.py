@@ -1,3 +1,6 @@
+import importlib.util
+import os
+from pathlib import Path
 import torch
 import triton
 import triton.language as tl
@@ -7,6 +10,26 @@ from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_a
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
 tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
+
+GLUON_KERNEL_PATH = Path(__file__).resolve().parent / "gluon_kernel" / "flash-attention-gluon.py"
+GLUON_BLOCK_CONFIG = {
+    "BLOCK_M": 64,
+    "BLOCK_N": 32,
+    "waves_per_eu": 6,
+    "num_stages": 1,
+    "num_warps": 4,
+}
+ENV_USE_GLUON_PREFILL = "FLASH_ATTENTION_TRITON_AMD_USE_GLUON_PREFILL"
+
+def load_gluon_attn_fwd():
+    spec = importlib.util.spec_from_file_location("flash_attn_gluon_prefill", GLUON_KERNEL_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load Gluon kernel from {GLUON_KERNEL_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "attn_fwd"):
+        raise AttributeError(f"attn_fwd not found in {GLUON_KERNEL_PATH}")
+    return getattr(module, "attn_fwd")
 
 # Convenience function to load with optional boundary checks.
 # "First" is the major dim, "second" is the minor dim.
@@ -634,6 +657,72 @@ def attention_prefill_forward_triton_impl(
                         bias.stride(3))
     else:
         bias_strides = (0, 0, 0, 0)
+
+    use_gluon_prefill = os.environ.get(ENV_USE_GLUON_PREFILL, "1").lower() in ("1", "true", "yes")
+    if use_gluon_prefill:
+        gluon_kernel = load_gluon_attn_fwd()
+        gluon_kernel[grid](
+            q,
+            k,
+            v,
+            bias,
+            cache_seqlens,
+            cache_batch_idx,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_o,
+            stride_descale_q_z,
+            stride_descale_k_z,
+            stride_descale_v_z,
+            stride_descale_o_z,
+            sm_scale,
+            softmax_lse,
+            o,
+            *q_strides,
+            *k_strides,
+            *v_strides,
+            *o_strides,
+            *bias_strides,
+            stride_az,
+            stride_ah,
+            *scores_strides,
+            stride_lse_z,
+            stride_lse_h,
+            stride_lse_m,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            dropout_p=dropout_p,
+            philox_seed=philox_seed,
+            philox_offset_base=philox_offset,
+            sd_mask=sd_mask,
+            dropout_mask=dropout_mask,
+            alibi_slopes=alibi_slopes,
+            HQ=nheads_q,
+            HK=nheads_k,
+            ACTUAL_BLOCK_DMODEL=head_size,
+            MAX_SEQLENS_Q=max_seqlens_q,
+            MAX_SEQLENS_K=max_seqlens_k,
+            IS_CAUSAL=causal,
+            IS_VARLEN=is_varlen,
+            IS_INFERENCE=is_inference,
+            BLOCK_DMODEL=padded_d_model,
+            USE_BIAS=False if bias is None else True,
+            USE_ALIBI=use_alibi,
+            ENABLE_DROPOUT=dropout_p > 0.0,
+            USE_EXP2=use_exp2,
+            RETURN_SCORES=return_softmax,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
+            FP8_OUTPUT=FP8_OUTPUT,
+            BLOCK_M=GLUON_BLOCK_CONFIG["BLOCK_M"],
+            BLOCK_N=GLUON_BLOCK_CONFIG["BLOCK_N"],
+            PRE_LOAD_V=False,
+            num_warps=GLUON_BLOCK_CONFIG["num_warps"],
+            num_stages=GLUON_BLOCK_CONFIG["num_stages"],
+            waves_per_eu=GLUON_BLOCK_CONFIG["waves_per_eu"],
+        )
+        return softmax_lse, sd_mask if return_softmax else None
 
     attn_fwd[grid](q, k, v, bias, cache_seqlens, cache_batch_idx,
                     descale_q, descale_k, descale_v, descale_o, stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_o_z,

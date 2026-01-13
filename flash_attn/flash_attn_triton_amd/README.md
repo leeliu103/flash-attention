@@ -107,6 +107,18 @@ You can use the other api functions in a similar way.
 
 
 
+###### Gluon Prefill Kernel
+
+To run the gluon prefill kernel tests:
+```
+FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE python -m pytest flash_attn/flash_attn_triton_amd/test_prefill_gluon.py -v
+```
+
+To run the gluon prefill kernel benchmarks:
+```
+FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE python flash_attn/flash_attn_triton_amd/benchmark_prefill_gluon.py --warmup 2 --iters 10
+```
+
 ##### Credits
 AMD Triton kernels team
 
