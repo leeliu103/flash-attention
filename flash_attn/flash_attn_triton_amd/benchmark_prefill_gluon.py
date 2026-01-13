@@ -160,6 +160,8 @@ def main() -> None:
         # LLaMA 3 70B
         #(1, 64, 8, 8192, 8192, 128, True, 0.0, "thd", True),
         # Wan2.1 Video Model (832x480, 81 frames)
+        (1, 40, 40, 32760, 32760, 128, True, 0.0, "thd", True),
+        (1, 40, 40, 32760, 32760, 128, True, 0.0, "thd", False),
         (1, 40, 40, 32760, 32760, 128, False, 0.0, "thd", True),
         (1, 40, 40, 32760, 32760, 128, False, 0.0, "thd", False),
     ]

@@ -14,7 +14,7 @@ ATOL, RTOL = 1e-2, 1e-2
         (1, 12, 12, 32760, 32760, 128),
     ],
 )
-@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("dropout_p", [0.0])
 @pytest.mark.parametrize("alibi_slopes", [None])
 @pytest.mark.parametrize("layout", ["thd"])

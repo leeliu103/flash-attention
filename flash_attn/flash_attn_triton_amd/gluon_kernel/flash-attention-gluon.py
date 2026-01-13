@@ -38,6 +38,7 @@ def _attn_fwd_inner(
     l_i,
     m_i,
     q_frag,
+    q_rows,
     k_ptr,
     v_ptr,
     base_k,
@@ -56,6 +57,9 @@ def _attn_fwd_inner(
     seqlen_k,
     block_min,
     block_max,
+    causal_shift,
+    APPLY_MASKS: ttgl.constexpr,
+    APPLY_CAUSAL: ttgl.constexpr,
     SM_SCALE: ttgl.constexpr,
     BLOCK_M: ttgl.constexpr,
     BLOCK_N: ttgl.constexpr,
@@ -75,7 +79,9 @@ def _attn_fwd_inner(
     RCP_LN2: ttgl.constexpr = 1.4426950408889634
 
     zero_qk = ttgl.zeros([BLOCK_M, BLOCK_N], ttgl.float32, layout=wmma_layout)
-    neg_inf = ttgl.full([BLOCK_M, BLOCK_N], -float("inf"), ttgl.float32, layout=wmma_layout)
+    neg_inf = ttgl.full(
+        [BLOCK_M, BLOCK_N], -float("inf"), ttgl.float32, layout=wmma_layout
+    )
 
     acc_local = acc
     l_local = l_i
@@ -99,11 +105,14 @@ def _attn_fwd_inner(
             + ttgl.expand_dims(offs_d_v, 0) * stride_vn
         )
 
-        mask_k = ttgl.expand_dims(k_rows, 0) < seqlen_k
-        mask_v = ttgl.expand_dims(v_rows, 1) < seqlen_k
-
-        k_tile = load_fn(k_ptr, k_offsets, mask=mask_k)
-        v_tile = load_fn(v_ptr, v_offsets, mask=mask_v)
+        if APPLY_MASKS:
+            mask_k = ttgl.expand_dims(ttgl.cast(k_rows, ttgl.int64), 0) < seqlen_k
+            mask_v = ttgl.expand_dims(ttgl.cast(v_rows, ttgl.int64), 1) < seqlen_k
+            k_tile = load_fn(k_ptr, k_offsets, mask=mask_k)
+            v_tile = load_fn(v_ptr, v_offsets, mask=mask_v)
+        else:
+            k_tile = load_fn(k_ptr, k_offsets)
+            v_tile = load_fn(v_ptr, v_offsets)
 
         k_smem.store(k_tile)
         v_smem.store(v_tile)
@@ -111,8 +120,20 @@ def _attn_fwd_inner(
         k_frag = k_smem.load(dot_k)
         v_frag = v_smem.load(dot_v)
 
-        valid_n = ttgl.expand_dims(start_n + offs_n_wmma, 0) < seqlen_k
-        qk_init = ttgl.where(valid_n, zero_qk, neg_inf)
+        if APPLY_MASKS:
+            k_rows_i64 = ttgl.cast(start_n + offs_n_wmma, ttgl.int64)
+            valid_n = ttgl.expand_dims(k_rows_i64, 0) < seqlen_k
+            qk_init = ttgl.where(valid_n, zero_qk, neg_inf)
+        else:
+            qk_init = zero_qk
+
+        if APPLY_CAUSAL:
+            causal_cols = ttgl.cast(start_n + offs_n_wmma + causal_shift, ttgl.int64)
+            causal_mask = (
+                ttgl.expand_dims(q_rows, 1) >= ttgl.expand_dims(causal_cols, 0)
+            )
+            qk_init = ttgl.where(causal_mask, qk_init, neg_inf)
+
         qk = ttgl.amd.rdna4.wmma(q_frag, k_frag, qk_init)
         qk_scaled = qk * SM_SCALE
 
@@ -262,6 +283,8 @@ def attn_fwd(
     offs_d_out = ttgl.arange(0, BLOCK_DMODEL, layout=ttgl.SliceLayout(0, wmma_layout))
 
     q_rows = pid_m * BLOCK_M + offs_m_blocked
+    q_rows_wmma = ttgl.cast(pid_m * BLOCK_M + offs_m_wmma, ttgl.int64)
+
     q_base = (
         off_z * stride_qz
         + off_h_q * stride_qh
@@ -298,11 +321,56 @@ def attn_fwd(
     )
 
     n_blocks = ttgl.cdiv(seqlen_k, BLOCK_N)
-    tail = seqlen_k - (n_blocks - 1) * BLOCK_N
-    masked_blocks = ttgl.where(tail < BLOCK_N, 1, 0)
+    if IS_CAUSAL:
+        n_blocks_seqlen = ttgl.cdiv(
+            (pid_m + 1) * BLOCK_M + seqlen_k - seqlen_q, BLOCK_N
+        )
+        n_blocks = ttgl.minimum(n_blocks, n_blocks_seqlen)
+        if n_blocks <= 0:
+            o_base = (
+                off_z * stride_oz
+                + off_h_q * stride_oh
+                + cu_seqlens_q_start * stride_om
+            )
+            o_offsets = (
+                o_base
+                + ttgl.expand_dims(pid_m * BLOCK_M + offs_m_wmma, 1) * stride_om
+                + ttgl.expand_dims(offs_d_out, 0) * stride_on
+            )
+            o_offsets = ttgl.cast(o_offsets, ttgl.int32)
+            o_mask = ttgl.expand_dims(pid_m * BLOCK_M + offs_m_wmma, 1) < seqlen_q
+            zero_out = ttgl.zeros(
+                [BLOCK_M, BLOCK_DMODEL], Out.type.element_ty, layout=wmma_layout
+            )
+            ttgl.amd.rdna4.buffer_store(zero_out, Out, o_offsets, mask=o_mask)
+
+            l_offset = (
+                off_z * stride_lse_z
+                + off_h_q * stride_lse_h
+                + cu_seqlens_q_start * stride_lse_m
+            )
+            l_ptrs = l_offset + (pid_m * BLOCK_M + offs_m_store) * stride_lse_m
+            l_ptrs = ttgl.cast(l_ptrs, ttgl.int32)
+            l_ptrs_mask = offs_m_store < MAX_SEQLENS_Q
+            l_zero = ttgl.zeros([BLOCK_M], ttgl.float32, layout=blocked_m)
+            ttgl.amd.rdna4.buffer_store(l_zero, LSE, l_ptrs, mask=l_ptrs_mask)
+            return
+
+    n_extra_tokens = ttgl.where(
+        seqlen_k < BLOCK_N,
+        BLOCK_N - seqlen_k,
+        ttgl.where(seqlen_k % BLOCK_N != 0, seqlen_k % BLOCK_N, 0),
+    )
+    is_modulo_mn = (n_extra_tokens == 0) & ((seqlen_q % BLOCK_M) == 0)
+    base_masked_blocks = ttgl.full((), BLOCK_M // BLOCK_N, ttgl.int64)
+    masked_blocks = base_masked_blocks + ttgl.where(
+        is_modulo_mn, ttgl.full((), 0, ttgl.int64), ttgl.full((), 1, ttgl.int64)
+    )
+    masked_blocks = ttgl.minimum(masked_blocks, n_blocks)
     n_full_blocks = n_blocks - masked_blocks
     block_min = n_full_blocks * BLOCK_N
     block_max = n_blocks * BLOCK_N
+    causal_shift = seqlen_q - seqlen_k
 
     if n_full_blocks > 0:
         acc, l_i, m_i = _attn_fwd_inner(
@@ -310,6 +378,7 @@ def attn_fwd(
             l_i,
             m_i,
             q_frag,
+            q_rows_wmma,
             K,
             V,
             k_base,
@@ -328,6 +397,9 @@ def attn_fwd(
             seqlen_k,
             0,
             block_min,
+            causal_shift,
+            False,
+            False,
             SM_SCALE,
             BLOCK_M,
             BLOCK_N,
@@ -341,6 +413,7 @@ def attn_fwd(
             l_i,
             m_i,
             q_frag,
+            q_rows_wmma,
             K,
             V,
             k_base,
@@ -359,6 +432,9 @@ def attn_fwd(
             seqlen_k,
             block_min,
             block_max,
+            causal_shift,
+            True,
+            IS_CAUSAL,
             SM_SCALE,
             BLOCK_M,
             BLOCK_N,
@@ -380,16 +456,24 @@ def attn_fwd(
         softmax_lse = (mi_base2 + ttgl.log2(l_i)) * LN2
     else:
         softmax_lse = m_i + ttgl.log(l_i)
-    l_store = ttgl.convert_layout(softmax_lse, layout=blocked_m)
 
+    start_m_idx = pid_m * BLOCK_M
     end_m_idx = (pid_m + 1) * BLOCK_M
     overflow_size = end_m_idx - seqlen_q
-    l_mask = None
+    causal_start_idx = seqlen_q - seqlen_k
+
+    if IS_CAUSAL:
+        lse_mask = (start_m_idx + offs_m_wmma) < causal_start_idx
+        softmax_lse = ttgl.where(lse_mask, 0.0, softmax_lse)
+
+    l_store = ttgl.convert_layout(softmax_lse, layout=blocked_m)
+
     if overflow_size > 0:
         boundary = BLOCK_M - overflow_size
         l_mask = offs_m_store < boundary
-
-    ttgl.amd.rdna4.buffer_store(l_store, LSE, l_ptrs, mask=l_mask)
+        ttgl.amd.rdna4.buffer_store(l_store, LSE, l_ptrs, mask=l_mask)
+    else:
+        ttgl.amd.rdna4.buffer_store(l_store, LSE, l_ptrs)
 
     o_base = (
         off_z * stride_oz
@@ -402,6 +486,20 @@ def attn_fwd(
         + ttgl.expand_dims(offs_d_out, 0) * stride_on
     )
     o_offsets = ttgl.cast(o_offsets, ttgl.int32)
+
+    if IS_CAUSAL:
+        if causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
+            out_mask_boundary = ttgl.full(
+                [BLOCK_M],
+                causal_start_idx,
+                ttgl.int32,
+                layout=ttgl.SliceLayout(1, wmma_layout),
+            )
+            out_ptrs_mask = (
+                ttgl.expand_dims(pid_m * BLOCK_M + offs_m_wmma, 1)
+                >= ttgl.expand_dims(out_mask_boundary, 1)
+            )
+            acc = ttgl.where(out_ptrs_mask, acc, ttgl.zeros_like(acc))
 
     o_mask = (ttgl.expand_dims(pid_m * BLOCK_M + offs_m_wmma, 1) < seqlen_q) & (
         ttgl.expand_dims(offs_d_out, 0) < ACTUAL_BLOCK_DMODEL
