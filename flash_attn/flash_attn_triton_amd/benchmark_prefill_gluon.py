@@ -90,6 +90,7 @@ def plot_results(results: List[Dict[str, float]]) -> None:
     gluon = [r["gluon_ms"] for r in results]
     triton = [r["triton_ms"] for r in results]
     ratios = [r["ratio"] for r in results]
+    gains = [r["gain_pct"] for r in results]
 
     x = range(len(labels))
     width = 0.35
@@ -97,7 +98,15 @@ def plot_results(results: List[Dict[str, float]]) -> None:
     ax.bar([i - width / 2 for i in x], gluon, width, label="Gluon")
     ax.bar([i + width / 2 for i in x], triton, width, label="Triton")
     for i, ratio in enumerate(ratios):
-        ax.text(i, max(gluon[i], triton[i]) * 1.02, f"ratio={ratio:.2f}", ha="center", va="bottom", fontsize=8)
+        label = f"ratio={ratio:.3f}\ngain={gains[i]:.2f}%"
+        ax.text(
+            i,
+            max(gluon[i], triton[i]) * 1.02,
+            label,
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
 
     ax.set_ylabel("ms per iteration")
     ax.set_title("Prefill forward: Gluon vs Triton")
@@ -204,7 +213,8 @@ def main() -> None:
             results["gluon_ms"] = benchmark_path(True, base_inputs, metadata, args.warmup, args.iters)
             results["triton_ms"] = benchmark_path(False, base_inputs, metadata, args.warmup, args.iters)
 
-        ratio = results["triton_ms"] / results["gluon_ms"]
+        ratio = results["gluon_ms"] / results["triton_ms"]  # Gluon relative to Triton baseline.
+        gain_pct = (1.0 - ratio) * 100.0  # Percent improvement vs Triton; positive means Gluon is faster.
 
         print(
             f"\nConfig: batch={batch}, hq={hq}, hk={hk}, seqlen_q={seqlen_q}, seqlen_k={seqlen_k}, "
@@ -214,7 +224,8 @@ def main() -> None:
         print(f"warmup={args.warmup}, iters={args.iters}")
         print(f"Gluon : {results['gluon_ms']:.3f} ms")
         print(f"Triton: {results['triton_ms']:.3f} ms")
-        print(f"Ratio : {ratio:.3f}  (Triton / Gluon; <1 means Triton is faster)")
+        print(f"Ratio : {ratio:.3f}  (Gluon / Triton; <1 means Gluon is faster)")
+        print(f"Gain  : {gain_pct:.2f}% (relative improvement vs Triton baseline)")
 
         all_results.append(
             {
@@ -222,6 +233,7 @@ def main() -> None:
                 "gluon_ms": results["gluon_ms"],
                 "triton_ms": results["triton_ms"],
                 "ratio": ratio,
+                "gain_pct": gain_pct,
             }
         )
 
