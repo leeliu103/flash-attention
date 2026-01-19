@@ -72,7 +72,8 @@ def _attn_fwd_inner(
     blocked_k: ttgl.constexpr = ttgl.BlockedLayout([8, 1], [16, 2], [1, 4], [0, 1])
     blocked_v: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [2, 16], [4, 1], [1, 0])
     shared_k: ttgl.constexpr = ttgl.SwizzledSharedLayout(8, 1, 16, order=[0, 1])
-    shared_v: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    shared_v_masked: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    shared_v_tr: ttgl.constexpr = ttgl.SwizzledSharedLayout(8, 2, 4, order=[0, 1])
     dot_k: ttgl.constexpr = ttgl.DotOperandLayout(1, wmma_layout, 8)
     dot_v: ttgl.constexpr = ttgl.DotOperandLayout(1, wmma_layout, 8)
     dot_p: ttgl.constexpr = ttgl.DotOperandLayout(0, wmma_layout, 8)
@@ -88,7 +89,14 @@ def _attn_fwd_inner(
     m_local = m_i
 
     k_smem = ttgl.allocate_shared_memory(ttgl.float16, [BLOCK_DMODEL, BLOCK_N], shared_k)
-    v_smem = ttgl.allocate_shared_memory(ttgl.float16, [BLOCK_N, BLOCK_DMODEL], shared_v)
+    if APPLY_MASKS:
+        v_smem = ttgl.allocate_shared_memory(
+            ttgl.float16, [BLOCK_N, BLOCK_DMODEL], shared_v_masked
+        )
+    else:
+        v_smem = ttgl.allocate_shared_memory(
+            ttgl.float16, [BLOCK_N, BLOCK_DMODEL], shared_v_tr
+        )
 
     for start_n in range(block_min, block_max, BLOCK_N):
         k_rows = start_n + offs_n_k
@@ -112,7 +120,8 @@ def _attn_fwd_inner(
             v_tile = load_fn(v_ptr, v_offsets, mask=mask_v)
         else:
             k_tile = load_fn(k_ptr, k_offsets)
-            v_tile = load_fn(v_ptr, v_offsets)
+            v_ptrs = v_ptr + ttgl.cast(v_offsets, ttgl.int32)
+            v_tile = ttgl.amd.rdna4.global_load_transpose(v_ptrs, blocked_v)
 
         k_smem.store(k_tile)
         v_smem.store(v_tile)
@@ -248,6 +257,13 @@ def attn_fwd(
     blocked_q: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [2, 16], [4, 1], [1, 0])
     blocked_k: ttgl.constexpr = ttgl.BlockedLayout([8, 1], [16, 2], [1, 4], [0, 1])
     blocked_v: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [2, 16], [4, 1], [1, 0])
+    linear_v_ptrs: ttgl.constexpr = ttgl.DistributedLinearLayout(
+        [[0, 1], [0, 2], [0, 4], [0, 32], [0, 64]],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]],
+        [[0, 8], [0, 16]],
+        [],
+        [BLOCK_N, BLOCK_DMODEL],
+    )
     blocked_m: ttgl.constexpr = ttgl.BlockedLayout([1], [32], [4], [0])
     shared_q: ttgl.constexpr = ttgl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
     RCP_LN2: ttgl.constexpr = 1.4426950408889634
@@ -275,11 +291,13 @@ def attn_fwd(
     offs_m_wmma = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, wmma_layout))
     offs_m_store = ttgl.arange(0, BLOCK_M, layout=blocked_m)
     offs_n_k = ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, blocked_k))
-    offs_n_v = ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(1, blocked_v))
+    offs_n_v_unmasked = ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(1, linear_v_ptrs))
+    offs_n_v_masked = ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(1, blocked_v))
     offs_n_wmma = ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, wmma_layout))
     offs_d_q = ttgl.arange(0, BLOCK_DMODEL, layout=ttgl.SliceLayout(0, blocked_q))
     offs_d_k = ttgl.arange(0, BLOCK_DMODEL, layout=ttgl.SliceLayout(1, blocked_k))
-    offs_d_v = ttgl.arange(0, BLOCK_DMODEL, layout=ttgl.SliceLayout(0, blocked_q))
+    offs_d_v_unmasked = ttgl.arange(0, BLOCK_DMODEL, layout=ttgl.SliceLayout(0, linear_v_ptrs))
+    offs_d_v_masked = ttgl.arange(0, BLOCK_DMODEL, layout=ttgl.SliceLayout(0, blocked_q))
     offs_d_out = ttgl.arange(0, BLOCK_DMODEL, layout=ttgl.SliceLayout(0, wmma_layout))
 
     q_rows = pid_m * BLOCK_M + offs_m_blocked
@@ -386,9 +404,9 @@ def attn_fwd(
             offs_m_wmma,
             offs_n_wmma,
             offs_n_k,
-            offs_n_v,
+            offs_n_v_unmasked,
             offs_d_k,
-            offs_d_v,
+            offs_d_v_unmasked,
             stride_kn,
             stride_vk,
             stride_kk,
@@ -421,9 +439,9 @@ def attn_fwd(
             offs_m_wmma,
             offs_n_wmma,
             offs_n_k,
-            offs_n_v,
+            offs_n_v_masked,
             offs_d_k,
-            offs_d_v,
+            offs_d_v_masked,
             stride_kn,
             stride_vk,
             stride_kk,
