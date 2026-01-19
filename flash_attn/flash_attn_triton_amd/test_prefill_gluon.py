@@ -11,7 +11,16 @@ ATOL, RTOL = 1e-2, 1e-2
 @pytest.mark.parametrize(
     "BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD",
     [
-        (1, 12, 12, 32760, 32760, 128),
+        # Wan2.2 T2V/I2V A14B 480p (832x480, 81 frames).
+        (1, 40, 40, 32760, 32760, 128),
+        # Wan2.2 T2V/I2V A14B 720p (1280x720, 81 frames).
+        (1, 40, 40, 75600, 75600, 128),
+        # Wan2.2 TI2V-5B (1280x704, 121 frames).
+        (1, 24, 24, 27280, 27280, 128),
+        # Wan2.2 S2V-14B (1024x704, 81 frames).
+        (1, 40, 40, 59136, 59136, 128),
+        # Wan2.2 Animate-14B (1280x720, 77 frames).
+        (1, 40, 40, 72000, 72000, 128),
     ],
 )
 @pytest.mark.parametrize("causal", [True, False])

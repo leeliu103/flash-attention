@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import time
 import torch
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -16,6 +17,8 @@ from flash_attn.flash_attn_triton_amd.fwd_prefill import (
 )
 from flash_attn.flash_attn_triton_amd.utils import input_helper
 
+PATH_COOLDOWN_S = 1.0
+CASE_COOLDOWN_S = 2.0
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -77,7 +80,7 @@ def run_prefill_once(
     )
 
 
-def plot_results(results: List[Dict[str, float]]) -> None:
+def plot_results(results: List[Dict[str, float]], chunk_idx: int, total_chunks: int) -> None:
     try:
         import matplotlib
         matplotlib.use("Agg")  # headless-friendly
@@ -109,12 +112,20 @@ def plot_results(results: List[Dict[str, float]]) -> None:
         )
 
     ax.set_ylabel("ms per iteration")
-    ax.set_title("Prefill forward: Gluon vs Triton")
+    if total_chunks > 1:
+        ax.set_title(f"Prefill forward: Gluon vs Triton (part {chunk_idx + 1}/{total_chunks})")
+    else:
+        ax.set_title("Prefill forward: Gluon vs Triton")
     ax.set_xticks(list(x))
     ax.set_xticklabels(labels, rotation=15)
     ax.legend()
     fig.tight_layout()
-    out_path = Path(__file__).with_suffix(".png")
+    if total_chunks > 1:
+        out_path = Path(__file__).with_name(
+            f"{Path(__file__).stem}_part{chunk_idx + 1}.png"
+        )
+    else:
+        out_path = Path(__file__).with_suffix(".png")
     plt.savefig(out_path, dpi=150)
     print(f"Saved plot to {out_path}")
     plt.close(fig)
@@ -168,11 +179,23 @@ def main() -> None:
         #(1, 32, 8, 8192, 8192, 128, True, 0.0, "thd", True),
         # LLaMA 3 70B
         #(1, 64, 8, 8192, 8192, 128, True, 0.0, "thd", True),
-        # Wan2.1 Video Model (832x480, 81 frames)
+        # Wan2.2 T2V/I2V A14B 480p (832x480, 81 frames)
         (1, 40, 40, 32760, 32760, 128, True, 0.0, "thd", True),
         (1, 40, 40, 32760, 32760, 128, True, 0.0, "thd", False),
         (1, 40, 40, 32760, 32760, 128, False, 0.0, "thd", True),
         (1, 40, 40, 32760, 32760, 128, False, 0.0, "thd", False),
+        # Wan2.2 T2V/I2V A14B 720p (1280x720, 81 frames)
+        (1, 40, 40, 75600, 75600, 128, False, 0.0, "thd", True),
+        (1, 40, 40, 75600, 75600, 128, False, 0.0, "thd", False),
+        # Wan2.2 TI2V-5B 720p (1280x704, 121 frames)
+        (1, 24, 24, 27280, 27280, 128, False, 0.0, "thd", True),
+        (1, 24, 24, 27280, 27280, 128, False, 0.0, "thd", False),
+        # Wan2.2 S2V-14B (1024x704, 81 frames)
+        (1, 40, 40, 59136, 59136, 128, False, 0.0, "thd", True),
+        (1, 40, 40, 59136, 59136, 128, False, 0.0, "thd", False),
+        # Wan2.2 Animate-14B (1280x720, 77 frames)
+        (1, 40, 40, 72000, 72000, 128, False, 0.0, "thd", True),
+        (1, 40, 40, 72000, 72000, 128, False, 0.0, "thd", False),
     ]
 
     print("Prefill forward benchmark (Gluon vs Triton)")
@@ -211,6 +234,7 @@ def main() -> None:
         with torch.inference_mode():
             results: Dict[str, float] = {}
             results["gluon_ms"] = benchmark_path(True, base_inputs, metadata, args.warmup, args.iters)
+            time.sleep(PATH_COOLDOWN_S)
             results["triton_ms"] = benchmark_path(False, base_inputs, metadata, args.warmup, args.iters)
 
         ratio = results["gluon_ms"] / results["triton_ms"]  # Gluon relative to Triton baseline.
@@ -236,8 +260,14 @@ def main() -> None:
                 "gain_pct": gain_pct,
             }
         )
+        time.sleep(CASE_COOLDOWN_S)
 
-    plot_results(all_results)
+    max_cases_per_plot = 8
+    total_chunks = (len(all_results) + max_cases_per_plot - 1) // max_cases_per_plot
+    for chunk_idx in range(total_chunks):
+        start = chunk_idx * max_cases_per_plot
+        end = start + max_cases_per_plot
+        plot_results(all_results[start:end], chunk_idx, total_chunks)
 
 
 if __name__ == "__main__":
